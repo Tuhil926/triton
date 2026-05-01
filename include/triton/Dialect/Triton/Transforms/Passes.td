@@ -90,4 +90,12 @@ def TritonLoopAwareCSE : Pass<"triton-loop-aware-cse", "mlir::ModuleOp"> {
   }];
 }
 
+def TritonCostModel: Pass</*cli-arg*/"triton-cost-model", /*Op*/"mlir::ModuleOp"> {
+  let summary = "A cost model for triton kernels";
+  let description = [{
+    This cost model is modeled upon the analytical cost model described in the hexcute paper.
+  }];
+
+  let dependentDialects = ["mlir::triton::TritonDialect"];
+}
 #endif
