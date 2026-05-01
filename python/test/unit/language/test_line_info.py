@@ -318,7 +318,7 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         @triton.jit
         def kernel_tensordesc_param(foo):
             # CHECK-LABEL: tt.func public @kernel_tensordesc_param
-            # CHECK-SAME: %foo: !tt.tensordesc<tensor<32x64xf16>>
+            # CHECK-SAME: %foo: !tt.tensordesc<32x64xf16>
             # CHECK-SAME: %foo.shape.0: i32
             # CHECK-SAME: %foo.shape.1: i32
             # CHECK-SAME: %foo.stride.0: i64
@@ -541,3 +541,8 @@ def test_line_and_column_numbers(fresh_triton_cache):
 
     check_template = inspect.getsource(kernel_basic.fn)
     run_filecheck("placeholder", h.asm["ttir"], check_template)
+
+
+@pytest.fixture(autouse=True)
+def with_line_info(fresh_knobs):
+    fresh_knobs.compilation.disable_line_info = False

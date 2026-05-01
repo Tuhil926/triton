@@ -12,29 +12,63 @@ using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
 namespace {
-Attribute findEncodingFromUsers(Operation *op) {
-  Attribute sharedEnc;
+// Validates that the tensor descriptor's strides and shared layout are
+// compatible with TDM. Requirements:
+//  - The shared order must be [rank-1, rank-2, ..., 0].
+//  - All stride-1 dimensions must be consecutive trailing dims.
+LogicalResult validateStridesAndSharedOrder(triton::MakeTensorDescOp op,
+                                            Attribute sharedEnc,
+                                            ArrayRef<int64_t> shape,
+                                            ValueRange strides) {
+  int rank = shape.size();
+  auto sharedOrder = triton::gpu::getOrder(
+      cast<triton::gpu::SharedEncodingTrait>(sharedEnc), shape);
+  SmallVector<unsigned> expectedOrder(llvm::reverse(llvm::seq<unsigned>(rank)));
+  if (sharedOrder != ArrayRef(expectedOrder)) {
+    return op.emitError() << "requires shared order [rank-1, rank-2, ..., 0]";
+  }
 
-  for (auto use : op->getUsers()) {
-    Attribute userEnc;
-    if (auto load = llvm::dyn_cast<amdgpu::AsyncTDMCopyGlobalToLocalOp>(use)) {
-      userEnc = load.getResult().getType().getEncoding();
-    } else if (auto store =
-                   llvm::dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(use)) {
-      userEnc = store.getSrc().getType().getEncoding();
+  auto isStride1 = [](Value v) {
+    return getConstantIntValue(getAsOpFoldResult(v)).value_or(0) == 1;
+  };
+  auto reversedStrides = llvm::reverse(strides);
+  auto firstNonStride1 = llvm::find_if_not(reversedStrides, isStride1);
+  if (firstNonStride1 == reversedStrides.begin())
+    return op.emitError() << "last dimension must have stride 1";
+  if (llvm::any_of(llvm::make_range(firstNonStride1, reversedStrides.end()),
+                   isStride1))
+    return op.emitError() << "requires all stride 1 dimensions to be "
+                             "consecutive starting from the last dimension";
+
+  return success();
+}
+
+// Collects all users of the value beyond the basic block boundaries
+// defining a given value.
+void collectUsers(Value value, llvm::SetVector<Operation *> &users) {
+  for (OpOperand &use : value.getUses()) {
+    Operation *userOp = use.getOwner();
+    if (users.contains(userOp)) {
+      // stop recursion; avoid loops
+      return;
     }
-    if (!userEnc)
-      continue;
+    users.insert(userOp);
+    const unsigned argIdx = use.getOperandNumber();
 
-    // Assign first encoding found; or error out if different encoding is found
-    if (!sharedEnc)
-      sharedEnc = userEnc;
-    else if (sharedEnc != userEnc) {
-      op->emitError("Descriptor is used with different shared encodings.");
-      return {};
+    if (auto unrealCast = dyn_cast<mlir::UnrealizedConversionCastOp>(userOp)) {
+      collectUsers(unrealCast->getResult(argIdx), users);
+    }
+
+    if (auto branch = dyn_cast<mlir::BranchOpInterface>(userOp)) {
+      auto successors = branch->getSuccessors();
+      for (auto [idx, successor] : llvm::enumerate(successors)) {
+        auto operands = branch.getSuccessorOperands(idx);
+        if (argIdx < operands.size()) {
+          collectUsers(successor->getArgument(argIdx), users);
+        }
+      }
     }
   }
-  return sharedEnc;
 }
 
 struct MakeTensorDescOpConversion
@@ -52,42 +86,49 @@ struct MakeTensorDescOpConversion
     auto result = op.getResult();
 
     auto tensorDescTy = result.getType();
-    auto blockTy = tensorDescTy.getBlockType();
-    auto sharedEnc = blockTy.getEncoding();
+    auto sharedEnc = tensorDescTy.getSharedLayout();
     if (!sharedEnc) {
-      // TODO: add an extra pass to assign layout to descriptors
-      sharedEnc = findEncodingFromUsers(op);
-      if (!sharedEnc)
-        return rewriter.notifyMatchFailure(op, "Descriptor has no layout.");
+      return rewriter.notifyMatchFailure(
+          op, "Descriptor has no shared memory layout assigned.");
     }
-    auto paddedEnc = llvm::dyn_cast<PaddedSharedEncodingAttr>(sharedEnc);
-
     unsigned padInterval = 0;
     unsigned padAmount = 0;
-    if (paddedEnc) {
-      if (paddedEnc.getIntervals().size() != 1 ||
-          paddedEnc.getPaddings().size() != 1)
+    if (auto padEnc = getPaddedEncoding(sharedEnc)) {
+      if (padEnc.getIntervals().size() != 1 || padEnc.getPaddings().size() != 1)
         return rewriter.notifyMatchFailure(
             op, "NYI: Multiple interval-padding pairs in TDM.");
-      padInterval = paddedEnc.getIntervals()[0];
-      padAmount = paddedEnc.getPaddings()[0];
+      padInterval = padEnc.getIntervals()[0];
+      padAmount = padEnc.getPaddings()[0];
     }
 
     Type elementType =
-        getTypeConverter()->convertType(blockTy.getElementType());
-    SmallVector<int64_t> blockShape = to_vector(blockTy.getShape());
+        getTypeConverter()->convertType(tensorDescTy.getElementType());
+    SmallVector<int64_t> blockShape = to_vector(tensorDescTy.getShape());
     int numWarps = lookupNumWarps(op);
     auto shapePerCTA = triton::gpu::getShapePerCTA(sharedEnc, blockShape);
 
+    if (failed(validateStridesAndSharedOrder(op, sharedEnc, shapePerCTA,
+                                             tensorStride))) {
+      return failure();
+    }
+    auto sharedOrder = triton::gpu::getOrder(
+        cast<triton::gpu::SharedEncodingTrait>(sharedEnc), shapePerCTA);
+    bool isRowMajor = sharedOrder[0] == (sharedOrder.size() - 1);
     // Create TDM descriptor for 2D-5D tensors
     auto tdmDesc = LLVM::AMD::createTDMDescriptor(
         rewriter, loc, getTypeConverter(), elementType, shapePerCTA, numWarps,
-        padInterval, padAmount, tensorShape, tensorStride, basePtr);
+        padInterval, padAmount, tensorShape, tensorStride, basePtr, sharedEnc);
 
+    // `getAllGroups()` returns 2 (2D) or 4 (3D-5D) vector Values; scalarize
+    // them into 12 or 20 i32 scalars to match the flat MLIR struct type
+    // returned by `convertTensorDescType` (which matches the host-side
+    // TDMDescriptor ABI).
     SmallVector<Value> groups = tdmDesc.getAllGroups();
+    SmallVector<Value> scalars =
+        mlir::LLVM::AMD::scalarizeTDMDescriptor(rewriter, loc, groups);
 
-    auto desc =
-        packLLElements(loc, getTypeConverter(), groups, rewriter, tensorDescTy);
+    auto desc = packLLElements(loc, getTypeConverter(), scalars, rewriter,
+                               tensorDescTy);
 
     rewriter.replaceOp(op, desc);
     return success();

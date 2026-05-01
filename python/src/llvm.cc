@@ -1,7 +1,7 @@
 #include "mlir/IR/BuiltinOps.h" // mlir::ModuleOp
 #include "mlir/Target/LLVMIR/LLVMTranslationInterface.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/CodeGen/MIRParser/MIRParser.h"
@@ -22,6 +22,7 @@
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/CodeGen.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
@@ -48,6 +49,8 @@ struct BreakStructPhiNodesPass : PassInfoMixin<BreakStructPhiNodesPass> {
 } // namespace llvm
 
 using namespace llvm;
+
+namespace {
 
 // Set an LLVM command-line option using addOccurrence (simulates command-line)
 // and return its original value. Using addOccurrence instead of setValue is
@@ -133,7 +136,6 @@ createTargetMachine(llvm::Module *module, std::string proc,
   bool disableLLVMOpt = mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (enable_fp_fusion)
     opt.AllowFPOpFusion = llvm::FPOpFusion::Fast;
-  opt.NoNaNsFPMath = true;
   opt.TrapUnreachable = true;
   opt.MCOptions.AsmVerbose = true;
   opt.MCOptions.PreserveAsmComments = true;
@@ -507,6 +509,8 @@ translateMIRToASM(const std::string &mirPath, const std::string &triple,
 
 using ret = py::return_value_policy;
 
+} // namespace
+
 void init_triton_llvm(py::module &&m) {
 
   py::class_<llvm::LLVMContext>(m, "context", py::module_local())
@@ -869,6 +873,11 @@ void init_triton_llvm(py::module &&m) {
       llvm::InitializeAllAsmParsers();
       llvm::InitializeAllAsmPrinters();
     });
+    // Disable LLVM's internal parallelism. Triton kernels produce small LLVM
+    // modules where pass-level parallelism is not beneficial, and LLVM's global
+    // thread pool is not fork-safe: a forked child inherits the pool's state
+    // but not its threads, causing SIGABRT on use or cleanup.
+    llvm::parallel::strategy = llvm::hardware_concurrency(1);
   });
 
   m.def("link_extern_libs", [](llvm::Module *dstMod,
@@ -911,7 +920,7 @@ void init_triton_llvm(py::module &&m) {
   });
 }
 
-void triton_stacktrace_signal_handler(void *) {
+static void triton_stacktrace_signal_handler(void *) {
   llvm::sys::PrintStackTrace(llvm::errs());
   raise(SIGABRT);
 }
